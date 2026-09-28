@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+from PIL import Image, ImageTk
+import subprocess
+import threading
+import os
+import re
+import xml.etree.ElementTree as ET
+import uuid
+import json
+from datetime import datetime
+
+try:
+    import ollama
+except ImportError:
+    ollama = None
+
+# --- Configuración Dinámica ---
+IMAGE_PATH = "/usr/local/share/mksil/logo.png"
+REPORT_DIR = os.path.expanduser("~/mksil_output")
+WORDLIST = "/usr/share/wordlists/dirb/common.txt"
+
+
+class TacticalAgent:
+    def __init__(self, data):
+        self.data = data
+
+    def get_narrative_analysis(self):
+        if not self.data["services"]:
+            return "[-] INSUFFICIENT DATA: No attack surface detected.", [], 0
+        total_risk = 0
+        attack_surface = []
+        for port, svc in self.data["services"].items():
+            name = svc["name"].lower()
+            product = svc.get("product", "").lower()
+            version = svc.get("version", "").lower()
+            risk = 0
+            if "http" in name: risk += 5
+            elif "smb" in name or port == "445": risk += 8
+            elif "db" in name or "sql" in name: risk += 6
+            elif "ssh" in name: risk += 3
+            port_exps = [e for e in self.data["exploits"] if re.search(rf"\b{re.escape(port)}\b", e)]
+            if port_exps: risk += min(10, len(port_exps) * 2)
+            keywords = [name, product]
+            critical_nuclei = [n for n in self.data["nuclei"] if "critical" in n.lower()]
+            if any(any(k in n.lower() for k in keywords if k) for n in critical_nuclei): risk += 10
+            if risk > 30: risk = 30 + (risk - 30) * 0.5
+            total_risk += risk
+            exposure = "CRITICAL" if risk >= 20 else "HIGH" if risk >= 15 else "MEDIUM" if risk >= 8 else "LOW"
+            attack_surface.append({"port": port, "service": svc["name"], "product": product, "version": version, "risk": round(risk, 1), "exposure": exposure})
+        attack_surface.sort(key=lambda x: (x["risk"]), reverse=True)
+        analysis = f"=== [ SENIOR PENTEST STRATEGY REPORT ] ===\n\nOBJETIVO: {self.data['target']}\nRISK SCORE: {round(total_risk, 1)}\n\n"
+        for item in attack_surface:
+            analysis += f"[PORT {item['port']}] {item['service']} -> EXPOSICIÓN: {item['exposure']} | SCORE: {item['risk']}\n"
+        return analysis, attack_surface, round(total_risk, 1)
+
+
+class DeepIntelligence:
+    def __init__(self, data):
+        self.data = data
+
+    def get_ai_strategy(self, callback):
+        if not ollama:
+            self._fallback_analysis(callback)
+            return
+        critical_services = {k: v for i, (k, v) in enumerate(self.data["services"].items()) if i < 5}
+        context = {
+            "target": self.data["target"],
+            "services_summary": list(critical_services.values()),
+            "top_vulns": self.data["nuclei"][:5],
+            "top_paths": self.data["fuzzer"][:5],
+        }
+        prompt = f"Eres un experto en Red Team. Plan de ataque conciso para: {json.dumps(context)}. Responde en ESPAÑOL."
+        try:
+            response = ollama.chat(
+                model="llama3",
+                messages=[
+                    {"role": "system", "content": "Responde siempre en formato breve y técnico."},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=True,
+            )
+            for chunk in response:
+                callback(chunk["message"]["content"])
+        except Exception as e:
+            callback(f"[-] ERROR IA: {str(e)}")
+
+    def _fallback_analysis(self, callback):
+        callback("[*] Análisis táctico local (ollama no disponible)\n\n")
+        for port, svc in self.data["services"].items():
+            name = svc["name"].lower()
+            if "http" in name:
+                callback(f"► Puerto {port} ({svc['name']}): Vector de entrada web.\n")
+                callback("  → Buscar: directorios ocultos, paneles admin, uploads.\n")
+                callback("  → Feroxbuster ya ejecutado. Revisar rutas encontradas.\n")
+            elif "smb" in name or port == "445":
+                callback(f"► Puerto {port} (SMB): RIESGO ALTO.\n")
+                callback("  → Intentar: enum4linux, smbclient, eternalblue (MS17-010).\n")
+            elif "sql" in name or "db" in name:
+                callback(f"► Puerto {port} ({svc['name']}): Base de datos expuesta.\n")
+                callback("  → Intentar: brute force credenciales, default creds, SQLi.\n")
+            elif "ssh" in name:
+                callback(f"► Puerto {port} (SSH): Brute force o credenciales débiles.\n")
+            elif "ftp" in name:
+                callback(f"► Puerto {port} (FTP): Anónimo login, escritura directa.\n")
+            elif "smtp" in name:
+                callback(f"► Puerto {port} (SMTP): Enumeración de usuarios, relay.\n")
+        if self.data["nuclei"]:
+            callback("\n► VULNS CRÍTICAS ENCONTRADAS:\n")
+            for v in self.data["nuclei"][:5]:
+                callback(f"  ! {v}\n")
+        callback("\n► ESTRATEGIA RECOMENDADA:\n")
+        callback("  1. Priorizar puertos CRITICAL/HIGH del reporte táctico.\n")
+        callback("  2. Explotar vulnerabilidades de nuclei confirmadas.\n")
+        callback("  3. Escalada de privilegios post-explotación.\n")
+        callback("  4. Instalar ollama para análisis IA profundo: pip install ollama\n")
+
+
+class MksilApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("MKSIL V7.8 - OFFENSIVE MASTER")
+        self.root.geometry("1100x580")
+        self.root.configure(bg="#050505")
+        self.scan_mode = tk.StringVar(value="fast")
+        self.scan_data = {"target": "", "services": {}, "nuclei": [], "exploits": [], "ports": [], "fuzzer": [], "ai_strategy": ""}
+        self.sidebar = tk.Frame(root, bg="#050505", width=240, highlightbackground="#00ff41", highlightthickness=2)
+        self.sidebar.pack(side="left", fill="y", padx=3, pady=3)
+        self.sidebar.pack_propagate(False)
+        try:
+            img = Image.open(IMAGE_PATH)
+            ratio = img.size[0] / img.size[1]
+            self.photo = ImageTk.PhotoImage(img.resize((200, int(200/ratio)), Image.Resampling.LANCZOS))
+            tk.Label(self.sidebar, image=self.photo, bg="#050505").pack(pady=3)
+        except: tk.Label(self.sidebar, text="M K S I L", font=("Courier New", 20, "bold"), fg="#00ff41", bg="#050505").pack(pady=8)
+        self.tabs_names = ["PUERTOS", "SERVICIOS", "NUCLEI", "FEROX", "EXPLOITS", "AGENT", "AI ADVISOR", "REPORT"]
+        self.tab_buttons = []
+        for i, name in enumerate(self.tabs_names):
+            btn_f = tk.Frame(self.sidebar, bg="#050505", highlightbackground="#00ff41", highlightthickness=1)
+            btn_f.pack(side="top", fill="x", padx=10, pady=2)
+            cmd = (lambda n=i: self.switch_tab(n)) if i < 7 else self.export_report
+            btn = tk.Button(btn_f, text=f"{i+1}. {name}", bg="#050505", fg="#00ff41", font=("Courier New", 10, "bold"), relief="flat", anchor="w", padx=10, pady=5, command=cmd)
+            btn.pack(fill="x"); self.tab_buttons.append(btn)
+        self.main_container = tk.Frame(root, bg="#050505"); self.main_container.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+        self.top_bar = tk.Frame(self.main_container, bg="#050505"); self.top_bar.pack(fill="x", pady=10)
+        tk.Label(self.top_bar, text="TARGET:", font=("Courier New", 11, "bold"), bg="#050505", fg="#00ff41").pack(side="left")
+        self.target_entry = tk.Entry(self.top_bar, bg="#000", fg="#fff", font=("Courier New", 10), width=18, highlightthickness=1, insertbackground="#fff")
+        self.target_entry.pack(side="left", padx=5, ipady=3)
+        self.fast_btn = tk.Button(self.top_bar, text="FAST", bg="#00ff41", fg="#000", font=("Courier New", 9), command=lambda: self.set_mode("fast")); self.fast_btn.pack(side="left", padx=3)
+        self.silent_btn = tk.Button(self.top_bar, text="STEALTH", bg="#111", fg="#666", font=("Courier New", 9), command=lambda: self.set_mode("silent")); self.silent_btn.pack(side="left", padx=3)
+        self.launch_btn = tk.Button(self.top_bar, text="DEPLOY MISSION", bg="#00ff41", font=("Courier New", 10, "bold"), padx=20, command=self.start_mission)
+        self.launch_btn.pack(side="right", padx=10)
+        self.pages = []; self.terminals_text = []
+        for i in range(7):
+            frame = tk.Frame(self.main_container, bg="#000", highlightbackground="#333", highlightthickness=1); self.pages.append(frame)
+            txt = scrolledtext.ScrolledText(frame, bg="#000", fg="#00ff41", font=("Courier New", 11), borderwidth=0)
+            txt.pack(fill="both", expand=True, padx=3, pady=3)
+            txt.tag_config("critical", foreground="#ff00ff", font=("Courier New", 10, "bold"))
+            txt.tag_config("high", foreground="#ff3333", font=("Courier New", 11, "bold"))
+            txt.tag_config("exploit", foreground="#00ccff", font=("Courier New", 11, "bold"))
+            self.terminals_text.append(txt)
+        self.current_idx = 0; self.pages[0].pack(fill="both", expand=True); self.switch_tab(0)
+        self.prog = ttk.Progressbar(self.main_container, orient="horizontal", mode="determinate"); self.prog.pack(fill="x", pady=5)
+
+        self.status_bar = tk.Frame(self.main_container, bg="#050505"); self.status_bar.pack(fill="x", pady=(2, 0))
+        tk.Label(self.status_bar, text="STATUS:", font=("Courier New", 9, "bold"), bg="#050505", fg="#00ff41").pack(side="left")
+        self.status_lbl = tk.Label(self.status_bar, text="EN ESPERA", font=("Courier New", 9, "bold"), bg="#050505", fg="#888")
+        self.status_lbl.pack(side="left", padx=5)
+        self.heartbeat_lbl = tk.Label(self.status_bar, text="[t:--:--] [xml:-] [puertos:0] [nmap:????]", font=("Courier New", 9), bg="#050505", fg="#888")
+        self.heartbeat_lbl.pack(side="right")
+        self._hb_running = False; self._hb_xml = None; self._hb_start = None
+        self.root.after(1000, self._heartbeat)
+
+        self.root.bind_all("<Control-a>", self._select_all_global)
+        self.root.bind_all("<Control-c>", self._copy_global)
+        self.root.bind_all("<Control-v>", self._paste_global)
+
+        self.ctx_menu = tk.Menu(root, tearoff=0, bg="#111", fg="#00ff41", font=("Courier New", 9))
+        self.ctx_menu.add_command(label="Copiar", command=self._ctx_copy)
+        self.ctx_menu.add_command(label="Pegar", command=self._ctx_paste)
+        self.ctx_menu.add_separator()
+        self.ctx_menu.add_command(label="Seleccionar todo", command=self._ctx_select_all)
+        self.root.bind_all("<Button-3>", self._show_ctx_menu)
+
+    def _copy_global(self, event=None):
+        w = self.root.focus_get()
+        if w:
+            try:
+                sel = w.selection_get()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(sel)
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _paste_global(self, event=None):
+        w = self.root.focus_get()
+        if w:
+            try:
+                clip = self.root.clipboard_get()
+                if isinstance(w, tk.Entry):
+                    if w.select_present():
+                        w.delete("sel.first", "sel.last")
+                    w.insert(tk.INSERT, clip)
+                elif isinstance(w, tk.Text):
+                    w.insert(tk.INSERT, clip)
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _select_all_global(self, event=None):
+        w = self.root.focus_get()
+        if w:
+            if isinstance(w, tk.Entry):
+                w.selection_range(0, tk.END)
+            elif isinstance(w, tk.Text):
+                w.tag_add("sel", "1.0", "end")
+            return "break"
+
+    def _show_ctx_menu(self, event):
+        w = event.widget
+        if isinstance(w, (tk.Entry, tk.Text, scrolledtext.ScrolledText)):
+            try:
+                w.focus_set()
+                self.ctx_menu.post(event.x_root, event.y_root)
+            except:
+                pass
+
+    def _ctx_copy(self):
+        self._copy_global()
+
+    def _ctx_paste(self):
+        self._paste_global()
+
+    def _ctx_select_all(self):
+        self._select_all_global()
+
+    def log_s(self, idx, msg):
+        tag = "critical" if "critical" in msg.lower() else "high" if "high" in msg.lower() else "exploit" if "[EXPLOIT]" in msg else "normal"
+        self.root.after(0, lambda: (self.terminals_text[idx].insert(tk.END, msg + "\n", tag), self.terminals_text[idx].see(tk.END)))
+
+    def set_mode(self, m):
+        self.scan_mode.set(m)
+        if m == "fast": self.fast_btn.config(bg="#00ff41", fg="#000"); self.silent_btn.config(bg="#111", fg="#666")
+        else: self.fast_btn.config(bg="#111", fg="#666"); self.silent_btn.config(bg="#00ff41", fg="#000")
+
+    def _heartbeat(self):
+        try:
+            if self._hb_running and self._hb_xml:
+                st = os.stat(self._hb_xml)
+                elapsed = (datetime.now() - self._hb_start).total_seconds()
+                hh, mm = int(elapsed // 60), int(elapsed % 60)
+                ports = 0
+                if os.path.exists(self._hb_xml):
+                    try:
+                        for _ in re.finditer(r'state="open"', open(self._hb_xml, encoding="utf-8", errors="ignore").read()): ports += 1
+                    except: pass
+                nm_alive = getattr(self, "_p_nm", None) is not None and self._p_nm.poll() is None
+                self.status_lbl.config(text="MISIÓN ACTIVA" if nm_alive else "NMAP TERMINADO", fg="#00ff41" if nm_alive else "#ffcc00")
+                self.heartbeat_lbl.config(text=f"[t:{hh:02d}:{mm:02d}] [xml:{st.st_size:,}B] [puertos:{ports}] [nmap:{'VIVO' if nm_alive else 'muerto'}]")
+            elif self._hb_running:
+                self.status_lbl.config(text="MISIÓN ACTIVA", fg="#00ff41")
+        except Exception:
+            pass
+        self.root.after(1000, self._heartbeat)
+
+    def switch_tab(self, idx):
+        self.pages[self.current_idx].pack_forget(); self.current_idx = idx; self.pages[idx].pack(fill="both", expand=True)
+        for i, b in enumerate(self.tab_buttons):
+            if i < 7:
+                if i == idx: b.config(bg="#00ff41", fg="#000")
+                else: b.config(bg="#050505", fg="#00ff41")
+
+    def start_mission(self):
+        t = self.target_entry.get().strip()
+        if not t: return
+        self.launch_btn.config(state="disabled")
+        self.scan_data = {"target": t, "start_time": datetime.now().strftime("%Y-%m-%d %H:%M"), "services": {}, "nuclei": [], "exploits": [], "ports": [], "fuzzer": [], "ai_strategy": ""}
+        for i in range(7): self.terminals_text[i].delete("1.0", tk.END)
+        self._hb_xml = None; self._hb_start = datetime.now(); self._hb_running = True
+        self._p_nm = None
+        threading.Thread(target=self.engine, args=(t,), daemon=True).start()
+
+    def engine(self, target):
+        mode = self.scan_mode.get(); xml_p = f"/tmp/mksil_{uuid.uuid4().hex}.xml"
+        self.root.after(0, lambda: self.switch_tab(0))
+        nmap_f = ["nmap", "-n", "-Pn", "-sV", "-oX", xml_p]
+        if mode == "fast": nmap_f += ["-T4", "--open"]
+        else: nmap_f += ["-sS", "-T2", "-f", "--data-length", "24"]
+        try:
+            self.log_s(0, f"[*] RECONNAISSANCE START: {target}")
+            p_nm = subprocess.Popen(nmap_f + [target], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self._p_nm = p_nm; self._hb_xml = xml_p
+            for line in p_nm.stdout: self.log_s(0, line.strip())
+            p_nm.wait()
+            self._p_nm = None
+            if os.path.exists(xml_p):
+                self._parse_xml(xml_p); self.root.after(0, lambda: self.prog.configure(value=20))
+
+                # Nuclei - Pass 1: Direct URLs
+                self.root.after(0, lambda: self.switch_tab(2))
+                n_cmd = ["nuclei", "-severity", "critical,high,medium", "-no-color", "-stats"]
+                web_ports_nuc = [p for p, s in self.scan_data["services"].items() if "http" in s["name"].lower() or p in ["80", "443", "8080", "8443"]]
+                for wp in web_ports_nuc:
+                    proto = "https" if wp == "443" or "https" in self.scan_data["services"][wp]["name"].lower() else "http"
+                    n_cmd += ["-u", f"{proto}://{target}:{wp}"]
+                if not web_ports_nuc:
+                    n_cmd += ["-u", f"http://{target}", "-u", f"https://{target}"]
+                if mode == "silent": n_cmd += ["-rate-limit", "10"]
+                p_nuc = subprocess.Popen(n_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in p_nuc.stdout:
+                    if line.strip(): self.log_s(2, line.strip()); self.scan_data["nuclei"].append(line.strip())
+                p_nuc.wait()
+
+                # Nuclei - Pass 2: Technology-specific templates
+                n_cmd2 = ["nuclei", "-severity", "critical,high", "-no-color", "-tags", "wordpress,cve,rce,lfi,sqli,xss,ssrf"]
+                for wp in web_ports_nuc:
+                    proto = "https" if wp == "443" or "https" in self.scan_data["services"][wp]["name"].lower() else "http"
+                    n_cmd2 += ["-u", f"{proto}://{target}:{wp}"]
+                if not web_ports_nuc:
+                    n_cmd2 += ["-u", f"http://{target}", "-u", f"https://{target}"]
+                if mode == "silent": n_cmd2 += ["-rate-limit", "5"]
+                p_nuc2 = subprocess.Popen(n_cmd2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in p_nuc2.stdout:
+                    if line.strip(): self.log_s(2, line.strip()); self.scan_data["nuclei"].append(line.strip())
+                p_nuc2.wait()
+                self.root.after(0, lambda: self.prog.configure(value=40))
+
+                # Feroxbuster
+                self.root.after(0, lambda: self.switch_tab(3))
+                web_ports = [p for p, s in self.scan_data["services"].items() if "http" in s["name"].lower() or p in ["80", "443", "8080", "8443"]]
+                for wp in web_ports[:2]:
+                    proto = "https" if wp == "443" or "https" in self.scan_data["services"][wp]["name"].lower() else "http"
+                    url = f"{proto}://{target}:{wp}"
+                    f_cmd = ["feroxbuster", "-u", url, "-w", WORDLIST, "-n", "-q", "--silent"]
+                    if mode == "fast": f_cmd += ["-t", "50", "--depth", "1"]
+                    else: f_cmd += ["-t", "10", "--rate-limit", "10", "--scan-limit", "1"]
+                    self.log_s(3, f"[*] FEROX: {url}")
+                    try:
+                        p3 = subprocess.Popen(f_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        for line in p3.stdout: self.log_s(3, line.strip()); self.scan_data["fuzzer"].append(line.strip())
+                        p3.wait()
+                    except Exception as e: self.log_s(3, f"[FEROX ERROR] {e}")
+                self.root.after(0, lambda: self.prog.configure(value=60))
+
+                # Exploits
+                self.root.after(0, lambda: self.switch_tab(4))
+                try:
+                    exp_out = subprocess.check_output(["searchsploit", "--nmap", xml_p], text=True)
+                    for line in exp_out.split("\n"):
+                        if "|" in line and not line.startswith("-"):
+                            msg = f"[EXPLOIT] {line.strip()}"; self.log_s(4, msg); self.scan_data["exploits"].append(msg)
+                except: pass
+                self.root.after(0, lambda: self.prog.configure(value=70))
+
+                # Agent Analysis
+                self.root.after(0, lambda: self.switch_tab(5))
+                agent = TacticalAgent(self.scan_data); narrative, _, _ = agent.get_narrative_analysis()
+                for line in narrative.split("\n"): self.log_s(5, line)
+                self.root.after(0, lambda: self.prog.configure(value=80))
+
+                # AI Advisor
+                self.root.after(0, lambda: self.switch_tab(6))
+                intelligence = DeepIntelligence(self.scan_data)
+                def ai_cb(chunk):
+                    self.root.after(0, lambda: (self.terminals_text[6].insert(tk.END, chunk), self.terminals_text[6].see(tk.END)))
+                    self.scan_data["ai_strategy"] += chunk
+                intelligence.get_ai_strategy(ai_cb)
+
+                self.root.after(0, lambda: self.prog.configure(value=100))
+                messagebox.showinfo("MKSIL", "Misión finalizada.")
+        except Exception as e: self.log_s(0, f"[CRITICAL ERROR] {e}")
+        finally:
+            if os.path.exists(xml_p): os.remove(xml_p)
+            self._hb_running = False; self._p_nm = None; self._hb_xml = None
+            self.root.after(0, lambda: self.status_lbl.config(text="EN ESPERA", fg="#888"))
+            self.root.after(0, lambda: self.launch_btn.config(state="normal"))
+
+    def _parse_xml(self, path):
+        try:
+            tree = ET.parse(path); root = tree.getroot()
+            for host in root.findall('host'):
+                ports_node = host.find('ports')
+                if ports_node is None: continue
+                for port in ports_node.findall('port'):
+                    p_id = port.get('portid'); state_node = port.find('state')
+                    if state_node is not None and state_node.get('state') == 'open':
+                        svc_node = port.find('service')
+                        if svc_node is not None:
+                            name = svc_node.get('name', 'unknown'); prod = svc_node.get('product', ''); ver = svc_node.get('version', ''); full = f"{name} {prod} {ver}".strip()
+                        else: name, prod, ver, full = "unknown", "", "", "unknown"
+                        if p_id not in self.scan_data["ports"]: self.scan_data["ports"].append(p_id)
+                        self.scan_data["services"][p_id] = {"name": name, "product": prod, "version": ver}
+                        self.log_s(1, f"[+] Puerto {p_id} -> {full}")
+        except Exception as e: self.log_s(1, f"[XML ERROR] {e}")
+
+    def export_report(self):
+        target = self.scan_data["target"] or "unknown"; path = os.path.join(REPORT_DIR, f"AUDIT_{target}.html")
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        agent = TacticalAgent(self.scan_data); narrative, attack_surface, risk_score = agent.get_narrative_analysis()
+        html = f"<html><body style='background:#050505;color:#e0e0e0;font-family:sans-serif;padding:50px;'><div style='max-width:1100px;margin:auto;border:1px solid #0f4;padding:50px;border-radius:12px;'><h1>Audit Report: {target}</h1><div style='background:#000;border-left:5px solid #0f4;padding:25px;'><h2>Strategy (Risk: {risk_score}/100)</h2><p style='white-space:pre-wrap;'>{narrative}</p></div><h2>Inventory</h2><table><tr><th>Port</th><th>Service</th><th>Exposure</th></tr>"
+        for it in attack_surface: html += f"<tr><td>{it['port']}</td><td>{it['service']} ({it['version']})</td><td>{it['exposure']}</td></tr>"
+        html += f"</table><h2>Nuclei</h2><pre>{chr(10).join(self.scan_data['nuclei'])}</pre><h2>Feroxbuster</h2><pre>{chr(10).join(self.scan_data['fuzzer'][:100])}</pre><h2>Exploits</h2><pre>{chr(10).join(self.scan_data['exploits'])}</pre><h2>AI Strategy</h2><pre style='white-space:pre-wrap;'>{self.scan_data['ai_strategy'] or 'Sin datos IA.'}</pre></div></body></html>"
+        with open(path, "w") as f: f.write(html)
+        messagebox.showinfo("MKSIL PRO", f"Reporte guardado en: {path}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk(); app = MksilApp(root); root.mainloop()
