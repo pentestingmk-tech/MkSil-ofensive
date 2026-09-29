@@ -34,9 +34,14 @@ unificado y sin intervención manual entre fases.
   **SENIOR PENTEST STRATEGY REPORT** ordenado por riesgo.
 - **AI ADVISOR**: análisis de estrategia de ataque generado por IA local
   (**Ollama + llama3**) con el contexto real del escaneo.
+- **Detección del SO por TTL**: calcula el sistema operativo del objetivo a
+  partir del TTL del ping (Linux/*BSD=64, Windows=128, Solaris/Cisco=255) e
+  incorpora la clasificación en vivo en la barra de estado, en el reporte del
+  agente táctico y en el informe HTML. Si el host no responde a ICMP, cae
+  limpio sin errores.
 - **Ejecución 100 % en paralelo/background**: la UI nunca se bloquea.
 - **Reporte HTML profesional** autocontenido, listo para entregar como
-  evidencia de auditoría (puertos, servicios, vulns, rutas, exploits,
+  evidencia de auditoría (SO, puertos, servicios, vulns, rutas, exploits,
   estrategia IA, risk score).
 
 ---
@@ -117,7 +122,8 @@ hilos/rate a feroxbuster, manteniendo un perfil bajo.
 | 8 | `REPORT` | Exporta el informe HTML |
 
 La barra de estado muestra en vivo: tiempo transcurrido, tamaño del XML de
-nmap, cantidad de puertos abiertos y estado del proceso.
+nmap, cantidad de puertos abiertos, el **SO detectado por TTL** y el estado del
+proceso.
 
 ---
 

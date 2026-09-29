@@ -22,6 +22,37 @@ REPORT_DIR = os.path.expanduser("~/mksil_output")
 WORDLIST = "/usr/share/wordlists/dirb/common.txt"
 
 
+def detect_os_by_ttl(target, timeout=5):
+    """Detecta el SO del objetivo calculando el TTL recibido (heurística clásica).
+    Devuelve (os, ttl, distancia_estimada) o (None, None, None) si falla."""
+    try:
+        out = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout), target],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout + 2,
+        ).stdout
+        m = re.search(r"(?:ttl|TTL)=(\d+)", out)
+        if not m:
+            return None, None, None
+        ttl = int(m.group(1))
+        # Heurística clásica por TTL inicial (Linux=64, Windows=128, Solaris/etc=255)
+        if 200 <= ttl <= 255:
+            osg = "UNIX / Solaris / Cisco (TTL 255)"
+        elif 128 <= ttl <= 199:
+            osg = "Windows (TTL 128)"
+        elif 64 <= ttl <= 127:
+            osg = "Linux / *BSD / macOS (TTL 64)"
+        elif ttl < 64:
+            osg = f"TTL < 64 (TTL {ttl}) — múltiples saltos u OS atípico"
+        else:
+            osg = f"TTL {ttl} — no clasificado"
+        # Distancia en saltos estimada según el TTL inicial mayor
+        base = 255 if ttl >= 200 else 128 if ttl >= 128 else 64
+        hops = max(0, base - ttl)
+        return osg, ttl, hops
+    except Exception:
+        return None, None, None
+
+
 class TacticalAgent:
     def __init__(self, data):
         self.data = data
@@ -50,7 +81,11 @@ class TacticalAgent:
             exposure = "CRITICAL" if risk >= 20 else "HIGH" if risk >= 15 else "MEDIUM" if risk >= 8 else "LOW"
             attack_surface.append({"port": port, "service": svc["name"], "product": product, "version": version, "risk": round(risk, 1), "exposure": exposure})
         attack_surface.sort(key=lambda x: (x["risk"]), reverse=True)
-        analysis = f"=== [ SENIOR PENTEST STRATEGY REPORT ] ===\n\nOBJETIVO: {self.data['target']}\nRISK SCORE: {round(total_risk, 1)}\n\n"
+        analysis = f"=== [ SENIOR PENTEST STRATEGY REPORT ] ===\n\nOBJETIVO: {self.data['target']}\nRISK SCORE: {round(total_risk, 1)}\n"
+        osd = self.data.get("os")
+        if osd:
+            analysis += f"SO DETECTADO (TTL): {osd} | TTL: {self.data.get('ttl')} | saltos: {self.data.get('hops')}\n"
+        analysis += "\n"
         for item in attack_surface:
             analysis += f"[PORT {item['port']}] {item['service']} -> EXPOSICIÓN: {item['exposure']} | SCORE: {item['risk']}\n"
         return analysis, attack_surface, round(total_risk, 1)
@@ -257,8 +292,9 @@ class MksilApp:
                         for _ in re.finditer(r'state="open"', open(self._hb_xml, encoding="utf-8", errors="ignore").read()): ports += 1
                     except: pass
                 nm_alive = getattr(self, "_p_nm", None) is not None and self._p_nm.poll() is None
-                self.status_lbl.config(text="MISIÓN ACTIVA" if nm_alive else "NMAP TERMINADO", fg="#00ff41" if nm_alive else "#ffcc00")
-                self.heartbeat_lbl.config(text=f"[t:{hh:02d}:{mm:02d}] [xml:{st.st_size:,}B] [puertos:{ports}] [nmap:{'VIVO' if nm_alive else 'muerto'}]")
+                os_tab = f"SO:{self.scan_data.get('os','?')[:12]}" if self.scan_data.get("os") else "SO:?"
+                self.status_lbl.config(text=(f"MISIÓN ACTIVA — {os_tab}" if nm_alive else f"NMAP TERMINADO — {os_tab}"), fg="#00ff41" if nm_alive else "#ffcc00")
+                self.heartbeat_lbl.config(text=f"[t:{hh:02d}:{mm:02d}] [xml:{st.st_size:,}B] [puertos:{ports}] [TTL:{self.scan_data.get('ttl','?')}] [nmap:{'VIVO' if nm_alive else 'muerto'}]")
             elif self._hb_running:
                 self.status_lbl.config(text="MISIÓN ACTIVA", fg="#00ff41")
         except Exception:
@@ -276,7 +312,7 @@ class MksilApp:
         t = self.target_entry.get().strip()
         if not t: return
         self.launch_btn.config(state="disabled")
-        self.scan_data = {"target": t, "start_time": datetime.now().strftime("%Y-%m-%d %H:%M"), "services": {}, "nuclei": [], "exploits": [], "ports": [], "fuzzer": [], "ai_strategy": ""}
+        self.scan_data = {"target": t, "start_time": datetime.now().strftime("%Y-%m-%d %H:%M"), "services": {}, "nuclei": [], "exploits": [], "ports": [], "fuzzer": [], "ai_strategy": "", "os": None, "ttl": None, "hops": None}
         for i in range(7): self.terminals_text[i].delete("1.0", tk.END)
         self._hb_xml = None; self._hb_start = datetime.now(); self._hb_running = True
         self._p_nm = None
@@ -290,6 +326,10 @@ class MksilApp:
         else: nmap_f += ["-sS", "-T2", "-f", "--data-length", "24"]
         try:
             self.log_s(0, f"[*] RECONNAISSANCE START: {target}")
+            os_d, ttl, hops = detect_os_by_ttl(target)
+            self.scan_data["os"], self.scan_data["ttl"], self.scan_data["hops"] = os_d, ttl, hops
+            if os_d: self.log_s(0, f"[*] OS DETECTADO POR TTL: {os_d} (TTL={ttl}, ~{hops} saltos)")
+            else: self.log_s(0, "[*] OS NO DETECTADO: el host no responde a ICMP")
             p_nm = subprocess.Popen(nmap_f + [target], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             self._p_nm = p_nm; self._hb_xml = xml_p
             for line in p_nm.stdout: self.log_s(0, line.strip())
@@ -399,7 +439,13 @@ class MksilApp:
         target = self.scan_data["target"] or "unknown"; path = os.path.join(REPORT_DIR, f"AUDIT_{target}.html")
         os.makedirs(REPORT_DIR, exist_ok=True)
         agent = TacticalAgent(self.scan_data); narrative, attack_surface, risk_score = agent.get_narrative_analysis()
-        html = f"<html><body style='background:#050505;color:#e0e0e0;font-family:sans-serif;padding:50px;'><div style='max-width:1100px;margin:auto;border:1px solid #0f4;padding:50px;border-radius:12px;'><h1>Audit Report: {target}</h1><div style='background:#000;border-left:5px solid #0f4;padding:25px;'><h2>Strategy (Risk: {risk_score}/100)</h2><p style='white-space:pre-wrap;'>{narrative}</p></div><h2>Inventory</h2><table><tr><th>Port</th><th>Service</th><th>Exposure</th></tr>"
+        osj = self.scan_data.get("os"); ttl = self.scan_data.get("ttl"); hops = self.scan_data.get("hops")
+        so_html = (f"<h2>SO detectado por TTL</h2><p style='border-left:4px solid #0f4;padding:12px 16px;background:#000;'>"
+                   f"<b>{osj}</b> &nbsp;|&nbsp; TTL: <b>{ttl}</b> &nbsp;|&nbsp; saltos estimados: <b>{hops}</b></p>"
+                   if osj else
+                   "<h2>SO detectado por TTL</h2><p style='border-left:4px solid #ffcc00;padding:12px 16px;background:#000;'>"
+                   "No detectado (el host no responde a ICMP).</p>")
+        html = f"<html><body style='background:#050505;color:#e0e0e0;font-family:sans-serif;padding:50px;'><div style='max-width:1100px;margin:auto;border:1px solid #0f4;padding:50px;border-radius:12px;'><h1>Audit Report: {target}</h1>{so_html}<div style='background:#000;border-left:5px solid #0f4;padding:25px;'><h2>Strategy (Risk: {risk_score}/100)</h2><p style='white-space:pre-wrap;'>{narrative}</p></div><h2>Inventory</h2><table><tr><th>Port</th><th>Service</th><th>Exposure</th></tr>"
         for it in attack_surface: html += f"<tr><td>{it['port']}</td><td>{it['service']} ({it['version']})</td><td>{it['exposure']}</td></tr>"
         html += f"</table><h2>Nuclei</h2><pre>{chr(10).join(self.scan_data['nuclei'])}</pre><h2>Feroxbuster</h2><pre>{chr(10).join(self.scan_data['fuzzer'][:100])}</pre><h2>Exploits</h2><pre>{chr(10).join(self.scan_data['exploits'])}</pre><h2>AI Strategy</h2><pre style='white-space:pre-wrap;'>{self.scan_data['ai_strategy'] or 'Sin datos IA.'}</pre></div></body></html>"
         with open(path, "w") as f: f.write(html)
